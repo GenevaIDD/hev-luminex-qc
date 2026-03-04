@@ -45,7 +45,16 @@ source("R/qc_standards.R")
 source("R/qc_beads.R")
 source("R/qc_standards_history.R")
 source("R/standard_4pl.R")
+source("R/subtract_blanks.R")
 
+
+# Order plate_id factor levels by the trailing plate number
+# e.g. PLATE_01292026_plate2 -> 2, PLATE_02192026_plate17 -> 17
+order_plate_id <- function(x) {
+  plate_num <- as.numeric(str_extract(x, "(?<=plate)\\d+$"))
+  lvls <- unique(x[order(plate_num, na.last = TRUE)])
+  factor(x, levels = lvls)
+}
 
 gt_theme_qc <- function(gt_tbl) {
   gt_tbl %>%
@@ -125,17 +134,24 @@ df <- read_xponent_plate(params$plate_file, value_datatype = params$value_dataty
 df <- df %>%
   filter(!str_detect(analyte, "^X(_\\d+)?$"), analyte != "", !is.na(analyte))
 
+# Compute plate summary BEFORE blank subtraction so that blank QC stats
+# (q99, median) reflect the raw signal levels for display and history tracking
+ps <- plate_summary(
+  df,
+  min_total_events = params$min_total_events,
+  blank_quantile = params$blank_quantile
+)
+
+# Subtract mean blank per plate/analyte from all values to get true Net MFI.
+# xPONENT's "Net MFI" is actually Median because blanks were not identified
+# in the instrument. Negative values are floored at 0.
+df <- subtract_plate_blanks(df)
+
 rep_tbl <- compute_replicate_variability(
   df,
   cv_threshold = params$cv_threshold,
   blank_quantile = params$blank_quantile,
   low_signal_rule = "blank_q99"
-)
-
-ps <- plate_summary(
-  df,
-  min_total_events = params$min_total_events,
-  blank_quantile = params$blank_quantile
 )
 
 # History
@@ -318,7 +334,7 @@ ggplot(rep_tbl, aes(x = rep1, y = rep2)) +
   geom_abline(intercept = 0, slope = 1, 
             linetype = "dashed", color = "grey50") +
   facet_wrap(~ analyte) +
-  labs(x = "Replicate 1 (Net MFI)", y = "Replicate 2 (Net MFI)")
+  labs(x = "Replicate 1 (Net MFI, blank-subtracted)", y = "Replicate 2 (Net MFI, blank-subtracted)")
 ```
 
 ## Blanks
@@ -336,7 +352,7 @@ ps$blanks %>%
 ggplot(ps$blanks, aes(x = analyte, y = blank_q99)) +
   geom_point() +
   coord_flip() +
-  labs(x = "Analyte", y = "Blank 99th percentile (Net MFI)")
+  labs(x = "Analyte", y = "Blank 99th percentile (raw MFI, pre-subtraction)")
 ```
 
 ## Across-plate trends (history)
@@ -356,11 +372,13 @@ rep_hist_new %>%
 
 ```{r}
 blank_hist_new %>%
+  mutate(plate_id = order_plate_id(plate_id)) %>%
   ggplot(aes(x = plate_id, y = value, group = analyte)) +
   geom_line() +
   geom_point() +
   facet_wrap(~ analyte, scales = "free_y") +
-  labs(x = "Plate ID", y = "Blank q99 (Net MFI)")
+  labs(x = "Plate ID", y = "Blank q99 (raw MFI, pre-subtraction)") +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
 ```
 
 ## Outputs (tables)
@@ -517,7 +535,7 @@ p <- ggplot() +
   facet_wrap(~ analyte, scales = "free_y") +
   labs(
     x = "Standard dilution denominator (log scale)",
-    y = "Net MFI",
+    y = "Net MFI (blank-subtracted)",
     shape = "Replicate",
     title = "Standard curves: observed historical data (grey) and current plate fit (black)"
   ) +
@@ -539,10 +557,10 @@ print(p)
 
 ```{r}
 pdat <- ctrl_hist_new %>%
-  mutate(is_current = plate_id == current_plate_id) %>%
-  # order plates by run_date if present
-  arrange(run_date, plate_id) %>%
-  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+  mutate(
+    is_current = plate_id == current_plate_id,
+    plate_id = order_plate_id(plate_id)
+  )
 
 pdat %>%
   ggplot(aes(x = plate_id, y = mfi, group = interaction(well_type, dilution))) +
@@ -554,7 +572,7 @@ pdat %>%
              aes(color = well_type, shape = dilution)) +
   facet_wrap(~ analyte, scales = "free_y") +
   scale_y_log10() +
-  labs(x = "Plate", y = "Control Net MFI (median, log scale)",
+  labs(x = "Plate", y = "Control Net MFI (median, log scale, blank-subtracted)",
        color = "Control", shape = "Dilution") +
   theme_bw() +
   theme(axis.text.x = element_text(angle = 60, hjust = 1))
@@ -565,9 +583,10 @@ pdat %>%
 ```{r}
 ctrl_pos_hist <- ctrl_hist_new %>%
   filter(well_type == "control_pos") %>%
-  mutate(is_current = plate_id == current_plate_id) %>%
-  arrange(run_date, plate_id) %>%
-  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+  mutate(
+    is_current = plate_id == current_plate_id,
+    plate_id = order_plate_id(plate_id)
+  )
 ```
 
 ```{r}
@@ -594,7 +613,7 @@ ggplot(ctrl_pos_hist, aes(x = plate_id, y = mfi, color = dilution)) +
   facet_wrap(~ analyte, scales = "free_y") +
   scale_y_log10() +
   labs(
-    x = "Plate", y = "Positive control Net MFI (median, log scale)",
+    x = "Plate", y = "Positive control Net MFI (median, log scale, blank-subtracted)",
     color = "Dilution",
     title = "Positive control MFI across plates"
   ) +
@@ -607,9 +626,10 @@ ggplot(ctrl_pos_hist, aes(x = plate_id, y = mfi, color = dilution)) +
 ```{r}
 ctrl_pos_rau_hist <- ctrl_hist_new %>%
   filter(well_type == "control_pos", !is.na(median_inv_rau)) %>%
-  mutate(is_current = plate_id == current_plate_id) %>%
-  arrange(run_date, plate_id) %>%
-  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+  mutate(
+    is_current = plate_id == current_plate_id,
+    plate_id = order_plate_id(plate_id)
+  )
 ```
 
 ```{r}
@@ -673,11 +693,11 @@ p <- ggplot(
   scale_x_log10() +
   facet_wrap(~ analyte, scales = "free_y") +
   labs(
-    x = "Net MFI (log scale)",
+    x = "Net MFI (log scale, blank-subtracted)",
     y = "Count",
     color = "Dilution",
     fill = "Dilution",
-    title = "Specimen Net MFI distribution by antigen and dilution"
+    title = "Specimen Net MFI distribution by antigen and dilution (blank-subtracted)"
   ) +
   theme(legend.position = "bottom")
 
@@ -716,6 +736,5 @@ ggplot(plot_df, aes(x = inv_rau, color = dilution, fill = dilution)) +
   theme(legend.position = "bottom")
 ```
 ## To dos:
-- Make it actually NET MFI
-- Check on LL4 fits and predictions 
+- Check on LL4 fits and predictions
 - Redo RAU plots of analytes
