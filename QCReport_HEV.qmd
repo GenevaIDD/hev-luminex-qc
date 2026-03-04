@@ -1,0 +1,721 @@
+---
+title: "HEV Luminex QC Report"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: false
+params:
+  plate_file: null
+  value_datatype: "Net MFI"
+  cv_threshold: 0.20
+  blank_quantile: 0.99
+  min_total_events: 50
+  bead_threshold: 30
+  history_rep_path: "outputs/history/replicate_history.rds"
+  history_blank_path: "outputs/history/blank_history.rds"
+  std_history_path: "outputs/history/std_curve_history.rds"
+  control_history_path: "outputs/history/control_mfi_history.rds"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,        # hide R code
+  message = FALSE,     # hide package attach messages
+  warning = FALSE,     # hide warnings like "built under R version"
+  error = TRUE,        # show errors if they happen
+  fig.align = "center"
+)
+
+# load packages
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(gt)
+library(DT)
+
+# Project functions
+source("R/read_xponent_plate.R")
+source("R/qc_replicates.R")
+source("R/qc_plate_summary.R")
+source("R/qc_history.R")
+source("R/qc_standards.R")
+source("R/qc_beads.R")
+source("R/qc_standards_history.R")
+source("R/standard_4pl.R")
+
+
+gt_theme_qc <- function(gt_tbl) {
+  gt_tbl %>%
+    opt_table_outline() %>%
+    opt_vertical_padding(scale = 0.75) %>%
+    tab_options(
+      table.font.size = px(13),
+      heading.title.font.size = px(16),
+      column_labels.font.weight = "bold",
+      data_row.padding = px(4)
+    )
+}
+
+# helper function (should probably add to a sperate R file)
+extract_control_points <- function(df) {
+  ctrl <- df %>%
+    mutate(
+      well_type = case_when(
+        str_detect(str_to_lower(sample), "\\bpos\\b") ~ "control_pos",
+        str_detect(str_to_lower(sample), "\\bneg\\b") ~ "control_neg",
+        TRUE ~ NA_character_
+      )
+    ) %>%
+    filter(!is.na(well_type), !is.na(value))
+
+  # compute 1/RAU if norm_denom is available (i.e. after 4PL normalization)
+  if ("norm_denom" %in% names(ctrl)) {
+    ctrl <- ctrl %>%
+      mutate(
+        dil_denom = case_when(
+          str_detect(dilution, "^1/") ~ as.numeric(sub("^1/", "", dilution)),
+          str_to_lower(dilution) %in% c("neat", "undiluted", "1") ~ 1,
+          TRUE ~ NA_real_
+        ),
+        inv_rau = if_else(
+          !is.na(norm_denom) & norm_denom > 0 & !is.na(dil_denom),
+          norm_denom / dil_denom,
+          NA_real_
+        )
+      )
+  }
+
+  result <- ctrl %>%
+    group_by(plate_id, run_date, analyte, dilution, well_type) %>%
+    summarise(
+      mfi = median(value, na.rm = TRUE),
+      n = dplyr::n(),
+      .groups = "drop"
+    )
+
+  if ("inv_rau" %in% names(ctrl)) {
+    rau_summary <- ctrl %>%
+      group_by(plate_id, run_date, analyte, dilution, well_type) %>%
+      summarise(
+        median_inv_rau = median(inv_rau, na.rm = TRUE),
+        .groups = "drop"
+      )
+    result <- left_join(result, rau_summary,
+                        by = c("plate_id", "run_date", "analyte", "dilution", "well_type"))
+  }
+
+  result
+}
+```
+
+
+```{r}
+stopifnot(!is.null(params$plate_file))
+
+
+df <- read_xponent_plate(params$plate_file, value_datatype = params$value_datatype)
+#df <- read_xponent_plate("data/raw/PlateRunResults_PLATE_01292026_plate2.csv", value_datatype = params$value_datatype)
+
+
+
+# Safety: drop placeholder analytes
+df <- df %>%
+  filter(!str_detect(analyte, "^X(_\\d+)?$"), analyte != "", !is.na(analyte))
+
+rep_tbl <- compute_replicate_variability(
+  df,
+  cv_threshold = params$cv_threshold,
+  blank_quantile = params$blank_quantile,
+  low_signal_rule = "blank_q99"
+)
+
+ps <- plate_summary(
+  df,
+  min_total_events = params$min_total_events,
+  blank_quantile = params$blank_quantile
+)
+
+# History
+rep_hist_old   <- history_load(params$history_rep_path)
+blank_hist_old <- history_load(params$history_blank_path)
+hist_records <- make_history_records(df, rep_tbl, ps$blanks)
+rep_hist_new <- history_append(rep_hist_old, hist_records$rep_hist,
+                               key_cols = c("plate_id","analyte"))
+blank_hist_new <- history_append(blank_hist_old, hist_records$blank_hist,
+                                 key_cols = c("plate_id","analyte"))
+
+history_save(rep_hist_new, params$history_rep_path)
+history_save(blank_hist_new, params$history_blank_path)
+
+## standards
+std_hist_path <- params$std_history_path
+std_hist_old <- std_history_load(std_hist_path)
+
+std_pts <- extract_std_points(df)
+std_hist_new <- std_history_append(std_hist_old, std_pts)
+
+std_history_save(std_hist_new, std_hist_path)
+
+
+current_plate_id <- df %>% summarise(pid = first(plate_id)) %>% pull(pid)
+
+plate_meta <- df %>%
+  summarise(
+    plate_id = first(plate_id),
+    plate_batch = first(plate_batch),
+    run_date = first(run_date),
+    panel = first(panel),
+    file = first(plate_file),
+    datatype = first(value_datatype)
+  )
+
+```
+
+## Plate overview
+
+```{r}
+plate_meta %>%
+  pivot_longer(everything(), names_to = "Field", values_to = "Value") %>%
+  gt() %>%
+  tab_header(title = "Plate overview") %>%
+  cols_width(Field ~ px(200), Value ~ px(520)) %>%
+  gt_theme_qc()
+```
+
+### Sample counts
+
+The table below shows the number of unique samples of each sample type and dilution (when applicable) on the plate.
+```{r}
+ps$counts %>%
+  arrange(well_type) %>%
+  gt() %>%
+  tab_header(title = "Sample counts") %>%
+  cols_label(well_type = "Sample type", n = "N") %>%
+  gt_theme_qc()
+```
+
+### Bead Summary
+
+How many beads of each type are present on the plate?
+
+```{r}
+expected_beads <- 96
+
+ps$analytes %>%
+  gt() %>%
+  tab_header(title = "Bead summary") %>%
+  cols_label(analyte = "Bead type", n = "N") %>%
+tab_style(
+  style = cell_text(color = "red", weight = "bold"),
+  locations = cells_body(
+    columns = n,
+    rows = n < expected_beads
+  )
+) %>%
+gt_theme_qc()
+```
+
+
+## Bead counts
+
+```{r}
+bead_flags <- df %>%
+  filter(!is.na(bead_count)) %>%
+  mutate(low_beads = bead_count < 30)
+
+bead_summary <- bead_flags %>%
+  summarise(
+    n_points = n(),
+    n_low = sum(low_beads),
+    pct_low = mean(low_beads),
+    min_beads = min(bead_count, na.rm = TRUE)
+  )
+
+bead_summary  %>%
+  gt()
+```
+
+### Wells/analytes with bead count < 30
+
+```{r}
+bead_flags %>%
+  filter(low_beads) %>%
+  distinct(well, sample, dilution, well_type, analyte, bead_count) %>%
+  arrange(bead_count) %>%
+  gt()
+```
+
+### Distribution of bead counts
+
+```{r}
+ggplot(bead_flags, aes(x = bead_count)) +
+  geom_histogram(bins = 50) +
+  labs(x = "Bead count (Count DataType)", y = "Number of well×analyte points")
+```
+
+
+
+## Replicate variability
+
+### Summary
+
+```{r}
+rep_summary <- rep_tbl %>%
+  summarise(
+    n_pairs = n(),
+    pct_fail = mean(flag == "fail_high_cv"),
+    pct_missing = mean(flag == "warn_missing_rep")
+  )
+
+rep_summary %>%
+  gt() %>%
+  tab_header(title = "Replicate variability summary") %>%
+  cols_label(
+    n_pairs = "Replicate pairs",
+    pct_fail = "% failing CV",
+    pct_missing = "% missing replicates"
+  ) %>%
+  fmt_percent(c(pct_fail, pct_missing), decimals = 1) %>%
+  gt_theme_qc()
+```
+
+### Worst replicate pairs
+
+```{r}
+rep_tbl %>%
+  arrange(desc(cv_primary)) %>%
+  select(sample, dilution, analyte, rep1, rep2, mean_raw, cv_primary, flag) %>%
+  head(30) %>%
+  gt() %>%
+  tab_header(title = "Worst replicate pairs (top 30)") %>%
+  fmt_number(c(rep1, rep2, mean_raw, cv_primary), decimals = 3) %>%
+  tab_style(
+    style = cell_text(weight = "bold", color = "firebrick"),
+    locations = cells_body(columns = flag, rows = flag != "pass")
+  ) %>%
+  gt_theme_qc()
+```
+
+### CV distribution by analyte
+
+```{r}
+ggplot(rep_tbl, aes(x = cv_primary)) +
+  geom_histogram(bins = 40) +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(x = "Primary CV (raw unless low-signal, then log-CV)", y = "Count")
+```
+
+### Replicate scatter (log scale)
+
+```{r}
+ggplot(rep_tbl, aes(x = rep1, y = rep2)) +
+  geom_point(alpha = 0.6) +
+  scale_x_log10() +
+  scale_y_log10() +
+  geom_abline(intercept = 0, slope = 1, 
+            linetype = "dashed", color = "grey50") +
+  facet_wrap(~ analyte) +
+  labs(x = "Replicate 1 (Net MFI)", y = "Replicate 2 (Net MFI)")
+```
+
+## Blanks
+
+```{r}
+ps$blanks %>%
+  arrange(analyte) %>%
+  gt() %>%
+  tab_header(title = "Blank signal by analyte") %>%
+  fmt_number(c(blank_q99, blank_median), decimals = 2) %>%
+  gt_theme_qc()
+```
+
+```{r}
+ggplot(ps$blanks, aes(x = analyte, y = blank_q99)) +
+  geom_point() +
+  coord_flip() +
+  labs(x = "Analyte", y = "Blank 99th percentile (Net MFI)")
+```
+
+## Across-plate trends (history)
+
+### Replicate fail rate over time
+
+```{r}
+rep_hist_new %>%
+  mutate(run_date = as.character(run_date)) %>%
+  ggplot(aes(x = run_date, y = pct_fail, group = analyte)) +
+  geom_point() +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(x = "Run date", y = "Pct replicate pairs failing (CV >= threshold)")
+```
+
+### Blank q99 trend over time
+
+```{r}
+blank_hist_new %>%
+  ggplot(aes(x = plate_id, y = value, group = analyte)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(x = "Plate ID", y = "Blank q99 (Net MFI)")
+```
+
+## Outputs (tables)
+
+```{r}
+out_dir <- "outputs/tables"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+rep_out <- file.path(out_dir, paste0("replicate_metrics_", plate_meta$plate_id, ".csv"))
+write.csv(rep_tbl, rep_out, row.names = FALSE)
+
+flags <- rep_tbl %>%
+  filter(flag != "pass") %>%
+  transmute(
+    plate_id, sample, dilution, analyte,
+    issue = flag,
+    cv_primary
+  )
+
+flags_out <- file.path(out_dir, paste0("qc_flags_", plate_meta$plate_id, ".csv"))
+write.csv(flags, flags_out, row.names = FALSE)
+
+list(replicate_metrics = rep_out, qc_flags = flags_out)
+```
+
+
+## Standard curves (per plate)
+```{r}
+std_df <- extract_standards(df)
+normalize_analytes <- c(
+  "ORF2 Bohm", "ORF2 Wantai", "ORF2-E2 Bohm",
+  "ORF2ID", "ORF3 Bohm"
+)
+
+fits_4pl <- fit_4pl_all(std_df)
+fits_4pl <- fits_4pl %>%
+  mutate(
+    use_for_norm = fit_ok & analyte %in% normalize_analytes
+  )
+
+# append normalized values to the main dataset
+df <- normalize_df_to_4pl(df, fits_4pl)
+
+# Controls history (after normalization so norm_denom / RAU is available)
+ctrl_hist_path <- params$control_history_path
+ctrl_hist_old <- history_load(ctrl_hist_path)
+
+ctrl_pts <- extract_control_points(df)
+ctrl_hist_new <- history_append(
+  ctrl_hist_old, ctrl_pts,
+  key_cols = c("plate_id", "analyte", "dilution", "well_type")
+)
+
+history_save(ctrl_hist_new, ctrl_hist_path)
+
+df %>%
+  summarise(
+    n_specimens = sum(sample_type == "specimen"),
+    n_specimens_with_norm = sum(sample_type == "specimen" & !is.na(norm_denom)),
+    pct_with_norm = n_specimens_with_norm / n_specimens
+  )
+
+std_levels <- std_df %>%
+  filter(!is_blank, !is.na(denom)) %>%
+  distinct(denom) %>%
+  arrange(denom)
+```
+
+### Standard curve fits (just to make sure)
+```{r}
+fits_4pl %>%
+  mutate(note = if_else(fit_ok, "", "fit failed / insufficient points")) %>%
+  select(plate_id, analyte, fit_ok, a, b, c, d, note)
+```
+
+### Standard curves by analyte
+```{r fig.width=12, fig.height=7}
+
+# ---- current plate standards (points) ----
+std_current <- std_df %>%
+  filter(
+    plate_id == unique(df$plate_id),
+    !is_blank,
+    !is.na(denom),
+    denom > 0
+  )
+
+# ---- current plate specimens ----
+spec_current <- df %>%
+  filter(plate_id == current_plate_id, well_type == "specimen", !is.na(value)) %>%
+  select(analyte, value, dilution)
+
+# ---- historical observed standards (grey lines) ----
+std_hist <- readRDS("outputs/history/std_curve_history.rds") %>%
+  filter(
+    plate_id != unique(df$plate_id),
+    !is.na(denom),
+    denom > 0
+  )
+
+# Optional: summarise replicates before connecting
+std_hist_summary <- std_hist %>%
+  group_by(plate_id, analyte, denom) %>%
+  summarise(
+    value = median(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# ---- fitted curve for current plate ----
+curve_current <- fits_4pl %>%
+  filter(fit_ok) %>%
+  rowwise() %>%
+  mutate(
+    denom = list(exp(seq(
+      log(min(std_current$denom[std_current$analyte == analyte])),
+      log(max(std_current$denom[std_current$analyte == analyte])),
+      length.out = 200
+    )))
+  ) %>%
+  tidyr::unnest(denom) %>%
+  mutate(
+    fitted = d + (a - d) / (1 + (denom / c)^b)
+  )
+
+# ---- plot ----
+p <- ggplot() +
+  # historical observed curves (grey)
+  geom_line(
+    data = std_hist_summary,
+    aes(
+      x = denom,
+      y = value,
+      group = plate_id
+    ),
+    color = "grey80",
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+  # current fitted curve (black)
+  geom_line(
+    data = curve_current,
+    aes(x = denom, y = fitted),
+    color = "black",
+    linewidth = 1.2
+  ) +
+  # current plate points (replicates separate)
+  geom_point(
+    data = std_current,
+    aes(x = denom, y = value, shape = factor(rep_index)),
+    size = 2.2,
+    alpha = 0.9
+  ) +
+  scale_x_log10() +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(
+    x = "Standard dilution denominator (log scale)",
+    y = "Net MFI",
+    shape = "Replicate",
+    title = "Standard curves: observed historical data (grey) and current plate fit (black)"
+  ) +
+  theme(legend.position = "bottom") + 
+  theme_minimal() + 
+  geom_rug(
+    data = spec_current,
+    aes(y = value, color = dilution),
+    sides = "r",
+    alpha = 0.35,
+    show.legend = TRUE
+  ) +
+  guides(color = guide_legend(title = "Specimen dilution"))
+ 
+print(p)
+```
+
+## Controls by plate
+
+```{r}
+pdat <- ctrl_hist_new %>%
+  mutate(is_current = plate_id == current_plate_id) %>%
+  # order plates by run_date if present
+  arrange(run_date, plate_id) %>%
+  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+
+pdat %>%
+  ggplot(aes(x = plate_id, y = mfi, group = interaction(well_type, dilution))) +
+  # historical
+  geom_point(data = ~dplyr::filter(.x, !is_current),
+             aes(color = well_type, shape = dilution, alpha = 0.6)) +
+  # current highlighted
+  geom_point(data = ~dplyr::filter(.x, is_current),
+             aes(color = well_type, shape = dilution)) +
+  facet_wrap(~ analyte, scales = "free_y") +
+  scale_y_log10() +
+  labs(x = "Plate", y = "Control Net MFI (median, log scale)",
+       color = "Control", shape = "Dilution") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+### Positive control MFI
+
+```{r}
+ctrl_pos_hist <- ctrl_hist_new %>%
+  filter(well_type == "control_pos") %>%
+  mutate(is_current = plate_id == current_plate_id) %>%
+  arrange(run_date, plate_id) %>%
+  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+```
+
+```{r}
+ctrl_pos_hist %>%
+  select(plate_id, run_date, analyte, dilution, mfi) %>%
+  arrange(plate_id, analyte, dilution) %>%
+  mutate(mfi = round(mfi, 1)) %>%
+  datatable(
+    caption = "Positive control MFI by plate, analyte, and dilution",
+    extensions = "Buttons",
+    options = list(
+      pageLength = 10,
+      dom = "Bfrtip",
+      buttons = c("csv", "excel")
+    ),
+    rownames = FALSE
+  )
+```
+
+```{r fig.width=12, fig.height=7}
+ggplot(ctrl_pos_hist, aes(x = plate_id, y = mfi, color = dilution)) +
+  geom_point(aes(alpha = is_current), size = 2.5) +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+  facet_wrap(~ analyte, scales = "free_y") +
+  scale_y_log10() +
+  labs(
+    x = "Plate", y = "Positive control Net MFI (median, log scale)",
+    color = "Dilution",
+    title = "Positive control MFI across plates"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+### Positive control 1/RAU
+
+```{r}
+ctrl_pos_rau_hist <- ctrl_hist_new %>%
+  filter(well_type == "control_pos", !is.na(median_inv_rau)) %>%
+  mutate(is_current = plate_id == current_plate_id) %>%
+  arrange(run_date, plate_id) %>%
+  mutate(plate_id = factor(plate_id, levels = unique(plate_id)))
+```
+
+```{r}
+ctrl_pos_rau_hist %>%
+  select(
+    Plate = plate_id,
+    `Run date` = run_date,
+    Analyte = analyte,
+    Dilution = dilution,
+    `Median 1/RAU` = median_inv_rau
+  ) %>%
+  arrange(Plate, Analyte, Dilution) %>%
+  mutate(`Median 1/RAU` = round(`Median 1/RAU`, 2)) %>%
+  datatable(
+    caption = "Positive control 1/RAU by plate, analyte, and dilution",
+    extensions = "Buttons",
+    options = list(
+      pageLength = 10,
+      dom = "Bfrtip",
+      buttons = c("csv", "excel")
+    ),
+    rownames = FALSE
+  )
+```
+
+```{r fig.width=12, fig.height=7}
+ggplot(ctrl_pos_rau_hist, aes(x = plate_id, y = median_inv_rau, color = dilution)) +
+  geom_point(aes(alpha = is_current), size = 2.5) +
+  scale_alpha_manual(values = c("TRUE" = 1, "FALSE" = 0.4), guide = "none") +
+  facet_wrap(~ analyte, scales = "free_y") +
+  scale_y_log10() +
+  labs(
+    x = "Plate", y = "Positive control 1/RAU (median, log scale)",
+    color = "Dilution",
+    title = "Positive control 1/RAU across plates"
+  ) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1))
+```
+
+## Specimen MFIs and RAUs
+
+```{r fig.width=12, fig.height=7}
+plot_df <- df %>%
+  filter(
+    well_type == "specimen",
+    !is.na(value),
+    value > 0,
+    !is.na(dilution)
+  )
+
+p <- ggplot(
+  plot_df,
+  aes(x = value, color = dilution, fill = dilution)
+) +
+  geom_histogram(
+    bins = 50,
+    alpha = 0.35,
+    position = "identity"
+  ) +
+  scale_x_log10() +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(
+    x = "Net MFI (log scale)",
+    y = "Count",
+    color = "Dilution",
+    fill = "Dilution",
+    title = "Specimen Net MFI distribution by antigen and dilution"
+  ) +
+  theme(legend.position = "bottom")
+
+print(p)
+```
+
+```{r fig.width=12, fig.height=7}
+plot_df <- df %>%
+  filter(
+    sample_type == "specimen",
+    !is.na(dilution),
+    !is.na(norm_denom),
+    norm_denom > 0
+  ) %>%
+  mutate(
+    dil_denom = case_when(
+      str_detect(dilution, "^1/") ~ as.numeric(sub("^1/", "", dilution)),
+      str_to_lower(dilution) %in% c("neat", "undiluted", "1") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    rau = dil_denom / norm_denom,
+    inv_rau = 1 / rau   # == norm_denom / dil_denom
+  )
+
+ggplot(plot_df, aes(x = inv_rau, color = dilution, fill = dilution)) +
+  geom_histogram(bins = 50, alpha = 0.35, position = "identity") +
+  scale_x_log10() +
+  facet_wrap(~ analyte, scales = "free_y") +
+  labs(
+    x = "1 / RAU (dilution-adjusted, log scale)",
+    y = "Count",
+    color = "Dilution",
+    fill = "Dilution",
+    title = "Specimen 1/RAU (dilution-adjusted) by antigen and dilution"
+  ) +
+  theme(legend.position = "bottom")
+```
+## To dos:
+- Make it actually NET MFI
+- Check on LL4 fits and predictions 
+- Redo RAU plots of analytes
