@@ -66,3 +66,15 @@ for f in $FILES; do
 done
 
 echo "✅ All QC reports rendered successfully."
+
+# -------------------------------
+# Copy reports to shared OneDrive
+# -------------------------------
+ONEDRIVE_DIR="/Users/andrewazman/Library/CloudStorage/OneDrive-SharedLibraries-UniversitédeGenève/HEV Epidemiology - Documents/luminex/plate-reports"
+
+if [[ -d "$ONEDRIVE_DIR" ]]; then
+  cp "$REPO_ROOT"/outputs/reports/*.html "$ONEDRIVE_DIR"/
+  echo "📂 Reports copied to OneDrive: $ONEDRIVE_DIR"
+else
+  echo "⚠️  OneDrive directory not found, skipping copy: $ONEDRIVE_DIR"
+fi

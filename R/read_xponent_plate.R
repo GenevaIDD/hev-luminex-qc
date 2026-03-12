@@ -64,7 +64,7 @@ source("R/utils.R")
 }
 .parse_well <- function(location) {
   # "1(1,A1)" -> "A1"
-  str_match(location, "\\(([A-H]\\d{1,2})\\)$")[,2]
+  str_match(location, ",([A-H]\\d{1,2})\\)$")[,2]
 }
 
 .classify_sample <- function(sample) {

@@ -10,6 +10,7 @@ params:
   plate_file: null
   value_datatype: "Net MFI"
   cv_threshold: 0.20
+  low_mfi_threshold: 50
   blank_quantile: 0.99
   min_total_events: 50
   bead_threshold: 30
@@ -150,8 +151,7 @@ df <- subtract_plate_blanks(df)
 rep_tbl <- compute_replicate_variability(
   df,
   cv_threshold = params$cv_threshold,
-  blank_quantile = params$blank_quantile,
-  low_signal_rule = "blank_q99"
+  low_mfi_threshold = params$low_mfi_threshold
 )
 
 # History
@@ -272,9 +272,48 @@ ggplot(bead_flags, aes(x = bead_count)) +
   labs(x = "Bead count (Count DataType)", y = "Number of well×analyte points")
 ```
 
+### Plate layout — median bead count by well
+
+```{r fig.width=10, fig.height=5}
+plate_beads <- bead_flags %>%
+  mutate(
+    row = str_extract(well, "^[A-H]"),
+    col = as.integer(str_extract(well, "\\d+"))
+  ) %>%
+  group_by(well, row, col) %>%
+  summarise(
+    median_beads = median(bead_count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(row = factor(row, levels = rev(LETTERS[1:8])))
+
+ggplot(plate_beads, aes(x = col, y = row, fill = median_beads)) +
+  geom_tile(color = "white", linewidth = 0.5) +
+  geom_text(aes(label = round(median_beads)), size = 3) +
+  scale_fill_gradient2(
+    low = "firebrick", mid = "lightyellow", high = "steelblue",
+    midpoint = median(plate_beads$median_beads, na.rm = TRUE)
+  ) +
+  scale_x_continuous(breaks = 1:12, position = "top") +
+  labs(x = NULL, y = NULL, fill = "Median\nbead count") +
+  coord_equal() +
+  theme_minimal() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text = element_text(face = "bold")
+  )
+```
+
 
 
 ## Replicate variability
+
+**Failure criteria:**
+
+- **fail_high_cv**: CV >= `r params$cv_threshold` and mean Net MFI >= `r params$low_mfi_threshold`
+- **low_signal**: Mean Net MFI < `r params$low_mfi_threshold` (CV not evaluated — too noisy to be meaningful)
+- **warn_missing_rep**: Fewer than 2 replicates available
+- **warn_uncomputable**: CV could not be computed (e.g., zero variance)
 
 ### Summary
 
@@ -283,6 +322,7 @@ rep_summary <- rep_tbl %>%
   summarise(
     n_pairs = n(),
     pct_fail = mean(flag == "fail_high_cv"),
+    pct_low_signal = mean(flag == "low_signal"),
     pct_missing = mean(flag == "warn_missing_rep")
   )
 
@@ -292,36 +332,49 @@ rep_summary %>%
   cols_label(
     n_pairs = "Replicate pairs",
     pct_fail = "% failing CV",
+    pct_low_signal = "% low signal",
     pct_missing = "% missing replicates"
   ) %>%
-  fmt_percent(c(pct_fail, pct_missing), decimals = 1) %>%
+  fmt_percent(c(pct_fail, pct_low_signal, pct_missing), decimals = 1) %>%
   gt_theme_qc()
 ```
 
-### Worst replicate pairs
+### Flagged replicate pairs
 
 ```{r}
 rep_tbl %>%
-  arrange(desc(cv_primary)) %>%
-  select(sample, dilution, analyte, rep1, rep2, mean_raw, cv_primary, flag) %>%
-  head(30) %>%
-  gt() %>%
-  tab_header(title = "Worst replicate pairs (top 30)") %>%
-  fmt_number(c(rep1, rep2, mean_raw, cv_primary), decimals = 3) %>%
-  tab_style(
-    style = cell_text(weight = "bold", color = "firebrick"),
-    locations = cells_body(columns = flag, rows = flag != "pass")
+  filter(flag != "pass") %>%
+  arrange(flag, desc(cv_raw)) %>%
+  select(
+    Sample = sample, Dilution = dilution, Analyte = analyte,
+    Rep1 = rep1, Rep2 = rep2, `Mean MFI` = mean_raw,
+    CV = cv_raw, Flag = flag
   ) %>%
-  gt_theme_qc()
+  mutate(
+    Rep1 = round(Rep1, 1),
+    Rep2 = round(Rep2, 1),
+    `Mean MFI` = round(`Mean MFI`, 1),
+    CV = round(CV, 3)
+  ) %>%
+  datatable(
+    caption = "All flagged replicate pairs (non-passing)",
+    extensions = "Buttons",
+    options = list(
+      pageLength = 10,
+      dom = "Bfrtip",
+      buttons = c("csv", "excel")
+    ),
+    rownames = FALSE
+  )
 ```
 
 ### CV distribution by analyte
 
 ```{r}
-ggplot(rep_tbl, aes(x = cv_primary)) +
+ggplot(rep_tbl, aes(x = cv_raw)) +
   geom_histogram(bins = 40) +
   facet_wrap(~ analyte, scales = "free_y") +
-  labs(x = "Primary CV (raw unless low-signal, then log-CV)", y = "Count")
+  labs(x = "CV (raw)", y = "Count")
 ```
 
 ### Replicate scatter (log scale)
@@ -395,7 +448,7 @@ flags <- rep_tbl %>%
   transmute(
     plate_id, sample, dilution, analyte,
     issue = flag,
-    cv_primary
+    cv_raw
   )
 
 flags_out <- file.path(out_dir, paste0("qc_flags_", plate_meta$plate_id, ".csv"))
@@ -413,7 +466,11 @@ normalize_analytes <- c(
   "ORF2ID", "ORF3 Bohm"
 )
 
-fits_4pl <- fit_4pl_all(std_df)
+# Only fit standard curves for target analytes — skip control beads
+# (BSA, EMPTY, GST) which have no dose-response with HEV standard
+std_df_target <- std_df %>% filter(analyte %in% normalize_analytes)
+
+fits_4pl <- fit_4pl_all(std_df_target)
 fits_4pl <- fits_4pl %>%
   mutate(
     use_for_norm = fit_ok & analyte %in% normalize_analytes
@@ -457,8 +514,8 @@ fits_4pl %>%
 ### Standard curves by analyte
 ```{r fig.width=12, fig.height=7}
 
-# ---- current plate standards (points) ----
-std_current <- std_df %>%
+# ---- current plate standards (points) — target analytes only ----
+std_current <- std_df_target %>%
   filter(
     plate_id == unique(df$plate_id),
     !is_blank,
@@ -466,15 +523,17 @@ std_current <- std_df %>%
     denom > 0
   )
 
-# ---- current plate specimens ----
+# ---- current plate specimens (target analytes only) ----
 spec_current <- df %>%
-  filter(plate_id == current_plate_id, well_type == "specimen", !is.na(value)) %>%
+  filter(plate_id == current_plate_id, well_type == "specimen", !is.na(value),
+         analyte %in% normalize_analytes) %>%
   select(analyte, value, dilution)
 
-# ---- historical observed standards (grey lines) ----
+# ---- historical observed standards (grey lines, target analytes only) ----
 std_hist <- readRDS("outputs/history/std_curve_history.rds") %>%
   filter(
     plate_id != unique(df$plate_id),
+    analyte %in% normalize_analytes,
     !is.na(denom),
     denom > 0
   )
@@ -735,6 +794,118 @@ ggplot(plot_df, aes(x = inv_rau, color = dilution, fill = dilution)) +
   ) +
   theme(legend.position = "bottom")
 ```
+
+### Dilution agreement (1/RAU)
+
+For each specimen and analyte, the 1/RAU values from the two dilutions should agree (fall on the 1:1 line) if the assay is behaving linearly. Points more than 2-fold off the diagonal are labelled.
+
+```{r fig.width=12, fig.height=8}
+library(ggrepel)
+
+# Median 1/RAU per sample/analyte/dilution (average over replicates)
+rau_wide <- df %>%
+  filter(
+    sample_type == "specimen",
+    !is.na(dilution),
+    !is.na(norm_denom),
+    norm_denom > 0
+  ) %>%
+  mutate(
+    dil_denom = case_when(
+      str_detect(dilution, "^1/") ~ as.numeric(sub("^1/", "", dilution)),
+      str_to_lower(dilution) %in% c("neat", "undiluted", "1") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    inv_rau = norm_denom / dil_denom
+  ) %>%
+  group_by(sample, analyte, dilution) %>%
+  summarise(inv_rau = median(inv_rau, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = dilution, values_from = inv_rau)
+
+# Identify the two dilution columns and sort by denominator (lower denom = x)
+dil_cols <- setdiff(names(rau_wide), c("sample", "analyte"))
+dil_denoms <- as.numeric(str_extract(dil_cols, "\\d+$"))
+dil_cols <- dil_cols[order(dil_denoms)]
+
+rau_wide <- rau_wide %>%
+  rename(dil_lo = !!dil_cols[1], dil_hi = !!dil_cols[2]) %>%
+  filter(!is.na(dil_lo), !is.na(dil_hi), dil_lo > 0, dil_hi > 0) %>%
+  mutate(
+    fold_diff = abs(log2(dil_lo / dil_hi)),
+    outlier = fold_diff > 1  # > 2-fold
+  )
+
+ggplot(rau_wide, aes(x = dil_lo, y = dil_hi)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(aes(color = outlier), alpha = 0.7, size = 1.8) +
+  geom_text_repel(
+    data = filter(rau_wide, outlier),
+    aes(label = sample),
+    size = 2.2, max.overlaps = 15, segment.alpha = 0.4
+  ) +
+  scale_x_log10() +
+  scale_y_log10() +
+  scale_color_manual(
+    values = c("FALSE" = "steelblue", "TRUE" = "firebrick"),
+    labels = c("< 2-fold", "> 2-fold"),
+    name = "Dilution\ndiscordance"
+  ) +
+  facet_wrap(~ analyte, scales = "free") +
+  labs(
+    x = paste0("1/RAU (", dil_cols[1], ")"),
+    y = paste0("1/RAU (", dil_cols[2], ")"),
+    title = "Dilution agreement: 1/RAU at two dilutions per specimen"
+  ) +
+  theme_bw()
+```
+
+## Analysis dataset
+
+```{r}
+# Build per-plate analysis dataset with curve params, RAU, and range flags
+analysis_df <- df %>%
+  filter(sample_type == "specimen", !is.na(value)) %>%
+  mutate(
+    dil_denom = case_when(
+      str_detect(dilution, "^1/") ~ as.numeric(sub("^1/", "", dilution)),
+      str_to_lower(dilution) %in% c("neat", "undiluted", "1") ~ 1,
+      TRUE ~ NA_real_
+    ),
+    inv_rau = if_else(
+      !is.na(norm_denom) & norm_denom > 0 & !is.na(dil_denom),
+      norm_denom / dil_denom,
+      NA_real_
+    )
+  ) %>%
+  select(
+    plate_id, run_date, plate_batch,
+    sample, dilution, dil_denom, well, analyte, rep_index,
+    value, bead_count,
+    a, b, c, d, fit_ok, use_for_norm,
+    std_mfi_min, std_mfi_max, quant_flag,
+    norm_denom, inv_rau
+  )
+
+# Append to cumulative analysis history (all plates)
+analysis_path <- "outputs/history/analysis_dataset.rds"
+analysis_old <- if (file.exists(analysis_path)) readRDS(analysis_path) else tibble()
+analysis_all <- bind_rows(analysis_old, analysis_df) %>%
+  distinct(plate_id, sample, dilution, analyte, rep_index, .keep_all = TRUE)
+
+dir.create(dirname(analysis_path), showWarnings = FALSE, recursive = TRUE)
+saveRDS(analysis_all, analysis_path)
+
+# Also write the cumulative dataset as CSV for easy access
+write.csv(
+  analysis_all,
+  "outputs/tables/analysis_dataset_all_plates.csv",
+  row.names = FALSE
+)
+
+nrow(analysis_df)
+```
+
+Cumulative analysis dataset saved to `outputs/history/analysis_dataset.rds` and `outputs/tables/analysis_dataset_all_plates.csv` with **`r nrow(analysis_all)`** total specimen rows across **`r n_distinct(analysis_all$plate_id)`** plates.
+
 ## To dos:
-- Check on LL4 fits and predictions
 - Redo RAU plots of analytes
