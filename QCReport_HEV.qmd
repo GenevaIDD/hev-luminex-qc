@@ -910,5 +910,57 @@ nrow(analysis_df)
 
 Cumulative analysis dataset saved to `outputs/history/analysis_dataset.rds` and `outputs/tables/analysis_dataset_all_plates.csv` with **`r nrow(analysis_all)`** total specimen rows across **`r n_distinct(analysis_all$plate_id)`** plates.
 
+### Standard curve data
+
+```{r}
+# Build standards dataset with MFI and back-calculated RAU
+std_export <- std_df_target %>%
+  filter(!is_blank, !is.na(denom), !is.na(value)) %>%
+  left_join(
+    fits_4pl %>% select(plate_id, analyte, a, b, c, d, fit_ok),
+    by = c("plate_id", "analyte")
+  ) %>%
+  mutate(
+    norm_denom = if_else(
+      fit_ok & value >= 0,
+      invert_4pl(value, a, b, c, d),
+      NA_real_
+    ),
+    inv_rau = if_else(
+      !is.na(norm_denom) & norm_denom > 0 & !is.na(denom),
+      norm_denom / denom,
+      NA_real_
+    )
+  ) %>%
+  select(
+    plate_id, run_date, analyte, sample,
+    dilution = std_dilution, denom,
+    well, rep_index,
+    mfi = value, bead_count,
+    a, b, c, d, fit_ok,
+    norm_denom, inv_rau
+  )
+
+std_out <- file.path(out_dir, paste0("standards_", plate_meta$plate_id, ".csv"))
+write.csv(std_export, std_out, row.names = FALSE)
+
+# Append to cumulative standards history (all plates)
+std_data_path <- "outputs/history/standards_dataset.rds"
+std_data_old <- if (file.exists(std_data_path)) readRDS(std_data_path) else tibble()
+std_data_all <- bind_rows(std_data_old, std_export) %>%
+  distinct(plate_id, analyte, denom, rep_index, .keep_all = TRUE)
+
+saveRDS(std_data_all, std_data_path)
+write.csv(
+  std_data_all,
+  "outputs/tables/standards_all_plates.csv",
+  row.names = FALSE
+)
+
+cat(sprintf("Standards CSV: %s (%d rows)\n", std_out, nrow(std_export)))
+cat(sprintf("Cumulative standards: %d rows across %d plates\n",
+            nrow(std_data_all), n_distinct(std_data_all$plate_id)))
+```
+
 ## To dos:
 - Redo RAU plots of analytes
