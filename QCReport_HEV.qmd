@@ -148,6 +148,9 @@ ps <- plate_summary(
 # in the instrument. Negative values are floored at 0.
 df <- subtract_plate_blanks(df)
 
+# Control beads — not target analytes; CV flags computed but not displayed
+control_beads <- c("BSA", "EMPTY", "GST")
+
 rep_tbl <- compute_replicate_variability(
   df,
   cv_threshold = params$cv_threshold,
@@ -314,10 +317,13 @@ ggplot(plate_beads, aes(x = col, y = row, fill = median_beads)) +
 - **warn_missing_rep**: Fewer than 2 replicates available
 - **warn_uncomputable**: CV could not be computed (e.g., zero variance)
 
+*Note: Control beads (BSA, EMPTY, GST) are excluded from the summary and flagged-pairs table below.*
+
 ### Summary
 
 ```{r}
 rep_summary <- rep_tbl %>%
+  filter(!analyte %in% control_beads) %>%
   summarise(
     n_pairs = n(),
     pct_fail = mean(flag == "fail_high_cv"),
@@ -340,7 +346,7 @@ rep_summary %>%
 
 ```{r}
 rep_tbl %>%
-  filter(flag != "pass") %>%
+  filter(flag != "pass", !analyte %in% control_beads) %>%
   arrange(flag, desc(cv_raw)) %>%
   select(
     Sample = sample, Dilution = dilution, Analyte = analyte,
