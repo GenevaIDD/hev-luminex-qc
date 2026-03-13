@@ -310,8 +310,7 @@ ggplot(plate_beads, aes(x = col, y = row, fill = median_beads)) +
 
 **Failure criteria:**
 
-- **fail_high_cv**: CV >= `r params$cv_threshold` and mean Net MFI >= `r params$low_mfi_threshold`
-- **low_signal**: Mean Net MFI < `r params$low_mfi_threshold` (CV not evaluated — too noisy to be meaningful)
+- **fail_high_cv**: CV >= `r params$cv_threshold` (pairs with mean Net MFI < `r params$low_mfi_threshold` are excluded — CV is unreliable at low signal)
 - **warn_missing_rep**: Fewer than 2 replicates available
 - **warn_uncomputable**: CV could not be computed (e.g., zero variance)
 
@@ -322,7 +321,6 @@ rep_summary <- rep_tbl %>%
   summarise(
     n_pairs = n(),
     pct_fail = mean(flag == "fail_high_cv"),
-    pct_low_signal = mean(flag == "low_signal"),
     pct_missing = mean(flag == "warn_missing_rep")
   )
 
@@ -332,10 +330,9 @@ rep_summary %>%
   cols_label(
     n_pairs = "Replicate pairs",
     pct_fail = "% failing CV",
-    pct_low_signal = "% low signal",
     pct_missing = "% missing replicates"
   ) %>%
-  fmt_percent(c(pct_fail, pct_low_signal, pct_missing), decimals = 1) %>%
+  fmt_percent(c(pct_fail, pct_missing), decimals = 1) %>%
   gt_theme_qc()
 ```
 

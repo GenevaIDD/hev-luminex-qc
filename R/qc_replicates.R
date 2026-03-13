@@ -19,13 +19,12 @@ compute_replicate_variability <- function(df,
       .groups = "drop"
     ) %>%
     mutate(
-      low_signal = mean_raw < low_mfi_threshold,
       flag = case_when(
-        n < 2                  ~ "warn_missing_rep",
-        is.na(cv_raw)          ~ "warn_uncomputable",
-        low_signal             ~ "low_signal",
-        cv_raw >= cv_threshold ~ "fail_high_cv",
-        TRUE                   ~ "pass"
+        n < 2                                    ~ "warn_missing_rep",
+        is.na(cv_raw)                            ~ "warn_uncomputable",
+        mean_raw < low_mfi_threshold             ~ "pass",
+        cv_raw >= cv_threshold                   ~ "fail_high_cv",
+        TRUE                                     ~ "pass"
       )
     ) %>%
     select(
@@ -33,7 +32,7 @@ compute_replicate_variability <- function(df,
       sample, dilution, analyte,
       rep1, rep2,
       mean_raw, cv_raw,
-      low_signal, flag
+      flag
     )
 
   reps
